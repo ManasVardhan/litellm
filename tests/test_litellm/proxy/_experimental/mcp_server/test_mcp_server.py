@@ -5570,6 +5570,81 @@ async def test_bare_authorization_never_probes_passthrough_servers():
     probe.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_delegate_preflight_end_to_end_against_live_upstream():
+    """No-mock integration for the delegate preflight: the real ``_probe_upstream_auth``
+    performs a real HTTP round trip to a live local upstream. A rejected token becomes
+    the connect-time 401 with the upstream-shaped RFC 6750 challenge; an accepted token
+    passes the preflight untouched. Only the registry lookup is patched."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from litellm.proxy._experimental.mcp_server.server import (
+        _check_passthrough_upstream_auth,
+    )
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    class StubUpstream(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            if length:
+                self.rfile.read(length)
+            if self.headers.get("Authorization") == "Bearer good-token":
+                body = b'{"jsonrpc":"2.0","id":1,"result":{}}'
+                self.send_response(200)
+            else:
+                body = b'{"error":"invalid_token"}'
+                self.send_response(401)
+                self.send_header(
+                    "WWW-Authenticate",
+                    'Bearer realm="stub-upstream", error="invalid_token"',
+                )
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            return
+
+    upstream = HTTPServer(("127.0.0.1", 0), StubUpstream)
+    upstream_port = upstream.server_address[1]
+    upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    upstream_thread.start()
+
+    server = _delegate_auth_mcp_server()
+    server_with_live_url = server.model_copy(update={"url": f"http://127.0.0.1:{upstream_port}/mcp"})
+
+    try:
+        with patch(
+            "litellm.proxy._experimental.mcp_server.server._get_allowed_mcp_servers",
+            new=AsyncMock(return_value=[server_with_live_url]),
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await _check_passthrough_upstream_auth(
+                    scope=_delegate_scope([(b"authorization", b"Bearer bogus-token")]),
+                    user_api_key_auth=UserAPIKeyAuth(),
+                    mcp_servers=["delegate_test"],
+                    client_ip=None,
+                )
+
+            await _check_passthrough_upstream_auth(
+                scope=_delegate_scope([(b"authorization", b"Bearer good-token")]),
+                user_api_key_auth=UserAPIKeyAuth(),
+                mcp_servers=["delegate_test"],
+                client_ip=None,
+            )
+    finally:
+        upstream.shutdown()
+        upstream_thread.join(timeout=5)
+        upstream.server_close()
+
+    assert exc_info.value.status_code == 401
+    challenge = exc_info.value.headers["www-authenticate"]
+    assert 'error="invalid_token"' in challenge
+    assert 'resource_metadata="http://localhost:4000/.well-known/oauth-protected-resource/mcp/delegate_test"' in challenge
+
+
 def test_is_delegate_upstream_probe_target_fails_closed_on_m2m_shape():
     """An unstamped M2M-shape row (null ``oauth2_flow`` + client credentials)
     resolves to ``client_credentials`` and must not be probed with the caller's
