@@ -5379,6 +5379,232 @@ def test_get_forwarded_auth_from_scope_skips_when_no_litellm_key_header():
     assert _get_forwarded_auth_from_scope(scope) is None
 
 
+def _delegate_auth_mcp_server(server_id: str = "delegate-1") -> MCPServer:
+    return MCPServer(
+        server_id=server_id,
+        name="delegate_test",
+        url="http://upstream:9401/mcp",
+        transport=MCPTransport.http,
+        auth_type=MCPAuth.oauth2,
+        delegate_auth_to_upstream=True,
+        oauth2_flow="authorization_code",
+    )
+
+
+def _delegate_scope(headers: list) -> dict:
+    return {
+        "type": "http",
+        "method": "POST",
+        "path": "/mcp/delegate_test",
+        "scheme": "http",
+        "server": ("localhost", 4000),
+        "headers": headers,
+    }
+
+
+@pytest.mark.asyncio
+async def test_delegate_bad_token_gets_connect_time_401():
+    """Regression (LIT-4194): a rejected upstream token on a delegate-auth server
+    must fail the connect with 401 + ``error="invalid_token"``, not be absorbed
+    into HTTP 200 + an empty tool list by the tools/list handler.
+
+    Delegate-mode clients send only ``Authorization`` (no ``x-litellm-api-key``),
+    so ``_get_forwarded_auth_from_scope`` returns None and, before the fix, the
+    preflight returned early without probing.
+    """
+    from litellm.proxy._experimental.mcp_server.server import (
+        _check_passthrough_upstream_auth,
+    )
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    server = _delegate_auth_mcp_server()
+    scope = _delegate_scope([(b"authorization", b"Bearer bogus-token")])
+
+    with patch(
+        "litellm.proxy._experimental.mcp_server.server._get_allowed_mcp_servers",
+        new=AsyncMock(return_value=[server]),
+    ), patch(
+        "litellm.proxy._experimental.mcp_server.server._probe_upstream_auth",
+        new=AsyncMock(return_value=(401, 'Bearer realm="upstream", error="invalid_token"')),
+    ) as probe:
+        with pytest.raises(HTTPException) as exc_info:
+            await _check_passthrough_upstream_auth(
+                scope=scope,
+                user_api_key_auth=UserAPIKeyAuth(),
+                mcp_servers=["delegate_test"],
+                client_ip=None,
+            )
+
+    assert exc_info.value.status_code == 401
+    challenge = exc_info.value.headers["www-authenticate"]
+    assert 'error="invalid_token"' in challenge
+    assert 'resource_metadata="http://localhost:4000/.well-known/oauth-protected-resource/mcp/delegate_test"' in challenge
+    probe.assert_awaited_once()
+    probe_url, probe_auth = probe.call_args.args
+    assert probe_url == "http://upstream:9401/mcp"
+    assert probe_auth == "Bearer bogus-token"
+
+
+@pytest.mark.asyncio
+async def test_delegate_valid_token_passes_preflight():
+    """An upstream-accepted token must not be blocked by the delegate preflight."""
+    from litellm.proxy._experimental.mcp_server.server import (
+        _check_passthrough_upstream_auth,
+    )
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    server = _delegate_auth_mcp_server()
+    scope = _delegate_scope([(b"authorization", b"Bearer good-token")])
+
+    with patch(
+        "litellm.proxy._experimental.mcp_server.server._get_allowed_mcp_servers",
+        new=AsyncMock(return_value=[server]),
+    ), patch(
+        "litellm.proxy._experimental.mcp_server.server._probe_upstream_auth",
+        new=AsyncMock(return_value=(200, None)),
+    ) as probe:
+        await _check_passthrough_upstream_auth(
+            scope=scope,
+            user_api_key_auth=UserAPIKeyAuth(),
+            mcp_servers=["delegate_test"],
+            client_ip=None,
+        )
+
+    probe.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_delegate_tokenless_request_not_probed():
+    """Tokenless delegate requests are the preemptive challenge's job; the
+    preflight must not probe upstream with an empty credential."""
+    from litellm.proxy._experimental.mcp_server.server import (
+        _check_passthrough_upstream_auth,
+    )
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    server = _delegate_auth_mcp_server()
+    scope = _delegate_scope([(b"content-type", b"application/json")])
+
+    with patch(
+        "litellm.proxy._experimental.mcp_server.server._get_allowed_mcp_servers",
+        new=AsyncMock(return_value=[server]),
+    ), patch(
+        "litellm.proxy._experimental.mcp_server.server._probe_upstream_auth",
+        new=AsyncMock(return_value=(401, None)),
+    ) as probe:
+        await _check_passthrough_upstream_auth(
+            scope=scope,
+            user_api_key_auth=UserAPIKeyAuth(),
+            mcp_servers=["delegate_test"],
+            client_ip=None,
+        )
+
+    probe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delegate_preflight_skipped_on_multi_server_routes():
+    """The delegate probe is gated to single-server routes so one rejected token
+    cannot 401 a multi-server aggregate connect (matching the OBO preflight)."""
+    from litellm.proxy._experimental.mcp_server.server import (
+        _check_passthrough_upstream_auth,
+    )
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    servers = [_delegate_auth_mcp_server("delegate-1"), _delegate_auth_mcp_server("delegate-2")]
+    scope = _delegate_scope([(b"authorization", b"Bearer bogus-token")])
+
+    with patch(
+        "litellm.proxy._experimental.mcp_server.server._get_allowed_mcp_servers",
+        new=AsyncMock(return_value=servers),
+    ), patch(
+        "litellm.proxy._experimental.mcp_server.server._probe_upstream_auth",
+        new=AsyncMock(return_value=(401, None)),
+    ) as probe:
+        await _check_passthrough_upstream_auth(
+            scope=scope,
+            user_api_key_auth=UserAPIKeyAuth(),
+            mcp_servers=["delegate_test", "other_server"],
+            client_ip=None,
+        )
+
+    probe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bare_authorization_never_probes_passthrough_servers():
+    """A bare ``Authorization`` header may be a LiteLLM key (backward-compat), so
+    only delegate servers (where admission classified it as an upstream token)
+    may be probed with it; ``is_oauth_passthrough`` servers still require the
+    unambiguous ``x-litellm-api-key`` + ``Authorization`` pair."""
+    from litellm.proxy._experimental.mcp_server.server import (
+        _check_passthrough_upstream_auth,
+    )
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    passthrough_server = MCPServer(
+        server_id="pt-1",
+        name="pt_server",
+        url="http://upstream:9402/mcp",
+        transport=MCPTransport.http,
+        auth_type=MCPAuth.none,
+        oauth_passthrough=True,
+        extra_headers=["Authorization"],
+    )
+    scope = _delegate_scope([(b"authorization", b"Bearer ambiguous-token")])
+
+    with patch(
+        "litellm.proxy._experimental.mcp_server.server._get_allowed_mcp_servers",
+        new=AsyncMock(return_value=[passthrough_server]),
+    ), patch(
+        "litellm.proxy._experimental.mcp_server.server._probe_upstream_auth",
+        new=AsyncMock(return_value=(401, None)),
+    ) as probe:
+        await _check_passthrough_upstream_auth(
+            scope=scope,
+            user_api_key_auth=UserAPIKeyAuth(),
+            mcp_servers=["pt_server"],
+            client_ip=None,
+        )
+
+    probe.assert_not_awaited()
+
+
+def test_is_delegate_upstream_probe_target_fails_closed_on_m2m_shape():
+    """An unstamped M2M-shape row (null ``oauth2_flow`` + client credentials)
+    resolves to ``client_credentials`` and must not be probed with the caller's
+    bearer; its stored client credentials drive egress instead."""
+    from litellm.proxy._experimental.mcp_server.server import (
+        _is_delegate_upstream_probe_target,
+    )
+
+    assert _is_delegate_upstream_probe_target(_delegate_auth_mcp_server()) is True
+
+    m2m_shape = MCPServer(
+        server_id="delegate-m2m",
+        name="delegate_m2m",
+        url="http://upstream:9401/mcp",
+        transport=MCPTransport.http,
+        auth_type=MCPAuth.oauth2,
+        delegate_auth_to_upstream=True,
+        oauth2_flow=None,
+        token_url="http://idp:9000/token",
+        client_id="client",
+        client_secret="secret",
+    )
+    assert _is_delegate_upstream_probe_target(m2m_shape) is False
+
+    non_delegate = MCPServer(
+        server_id="oauth2-plain",
+        name="oauth2_plain",
+        url="http://upstream:9401/mcp",
+        transport=MCPTransport.http,
+        auth_type=MCPAuth.oauth2,
+        oauth2_flow="authorization_code",
+    )
+    assert _is_delegate_upstream_probe_target(non_delegate) is False
+
+
 @pytest.mark.asyncio
 async def test_create_mcp_client_sampling_disabled_by_default():
     """Sampling callback must be None when allow_sampling is not set (default False)."""
